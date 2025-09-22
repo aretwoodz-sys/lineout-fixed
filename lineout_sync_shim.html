@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lineout Firestore Sync – Drop‑in Shim</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; }
+    .card { border: 1px solid rgba(0,0,0,.12); border-radius: 12px; padding: 12px; max-width: 880px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .row > * { margin: 4px 0; }
+    input[type="text"] { padding: 8px 10px; border: 1px solid rgba(0,0,0,.2); border-radius: 8px; min-width: 260px; }
+    button { padding: 8px 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,.2); cursor: pointer; background: #fff; }
+    button:hover { background: #f6f6f6; }
+    .muted { opacity: .7; font-size: 13px; }
+    pre { background: #0001; padding: 10px; border-radius: 8px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row">
+      <strong>Room:</strong>
+      <input id="room" type="text" placeholder="lineouts/<room-id>" />
+      <button id="startBtn">Init + Listen</button>
+      <button id="stopBtn">Stop</button>
+      <span id="status" class="muted">idle</span>
+    </div>
+    <div class="row">
+      <button id="seedBtn">Save Sample Rows</button>
+      <button id="emitBtn">Emit rows → page (simulate)</button>
+    </div>
+    <div class="muted">This file is a <em>non‑invasive</em> sync shim. It exposes <code>window.LineoutSync</code> and dispatches/consumes custom events. It will <b>not</b> touch your UI or override <code>applyRows()</code>.</div>
+    <details>
+      <summary>How to integrate (custom events)</summary>
+      <pre><code>// 1) Listen for server rows and render with your own code:
+window.addEventListener('lineout:rows', (e) => {
+  const { rows, meta } = e.detail;
+  // your applyRows(rows) here
+});
+
+// 2) Whenever you want to save your current rows:
+window.dispatchEvent(new CustomEvent('lineout:save', {
+  detail: { rows, meta: { title: 'Checklist', updatedAt: Date.now() } }
+}));
+</code></pre>
+    </details>
+  </div>
+
+  <!-- Firebase (modular v10); uses window.FIREBASE_CONFIG if present -->
+  <script type="module">
+    import { initializeApp, getApps } from 'https://www.gstatic.com/firebasejs/10.13.1/firebase-app.js';
+    import { getFirestore, doc, onSnapshot, setDoc, getDoc, serverTimestamp } from 'https://www.gstatic.com/firebasejs/10.13.1/firebase-firestore.js';
+    import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.13.1/firebase-auth.js';
+
+    // ---- Config ----
+    const DEFAULT_CONFIG = {
+      apiKey: "AIzaSyB-GAwSnt5mplQQ-0GV78Ud1v-JfqFuz0o",
+      authDomain: "lineout-3a851.firebaseapp.com",
+      projectId: "lineout-3a851",
+      storageBucket: "lineout-3a851.firebasestorage.app",
+      messagingSenderId: "133642224320",
+      appId: "1:133642224320:web:b47587ea9bbf80ea426325",
+      measurementId: "G-14R61YSV5V"
+    };
+    const cfg = (window.FIREBASE_CONFIG && typeof window.FIREBASE_CONFIG === 'object')
+      ? window.FIREBASE_CONFIG
+      : DEFAULT_CONFIG;
+
+    // ---- Init (idempotent) ----
+    const app = getApps().length ? getApps()[0] : initializeApp(cfg);
+    const db = getFirestore(app);
+    const auth = getAuth(app);
+
+    // ---- State ----
+    let unsub = null;
+    let currentRoom = null;
+    let writeToken = null; // prevents echo
+    let uid = null;
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (t) => $('status').textContent = t;
+
+    // ---- Auth (anon ok) ----
+    const readyAuth = new Promise((resolve, reject) => {
+      onAuthStateChanged(auth, async (user) => {
+        try {
+          if (!user) {
+            const cred = await signInAnonymously(auth);
+            uid = cred.user.uid;
+          } else {
+            uid = user.uid;
+          }
+          resolve(uid);
+        } catch (e) { reject(e); }
+      });
+    });
+
+    // ---- Helpers ----
+    function normalizeRows(maybeRows) {
+      if (!Array.isArray(maybeRows)) return [];
+      return maybeRows.map((r, idx) => ({
+        id: r?.id ?? idx,
+        item: r?.item ?? r?.text ?? '',
+        spliced: !!r?.spliced,
+        balanced: !!r?.balanced,
+        notes: r?.notes ?? '',
+        bg: r?.bg ?? ''
+      }));
+    }
+
+    async function saveToCloud(room, rows, meta={}) {
+      await readyAuth;
+      if (!room) throw new Error('No room id');
+      const token = Math.random().toString(36).slice(2);
+      writeToken = token;
+      const ref = doc(db, 'lineouts', room);
+      await setDoc(ref, {
+        rows: normalizeRows(rows),
+        meta: {
+          ...meta,
+          updatedBy: uid || null,
+          updatedAt: serverTimestamp(),
+        },
+        writeToken: token
+      }, { merge: true });
+    }
+
+    async function start(room) {
+      await readyAuth;
+      if (!room) throw new Error('No room id');
+      stop();
+      currentRoom = room;
+      const ref = doc(db, 'lineouts', room);
+
+      // Prime existing data (optional)
+      const snap0 = await getDoc(ref);
+      if (snap0.exists()) {
+        const data = snap0.data() || {};
+        const rows = normalizeRows(data.rows);
+        window.dispatchEvent(new CustomEvent('lineout:rows', { detail: { rows, meta: data.meta || {} } }));
+      }
+
+      unsub = onSnapshot(ref, (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data() || {};
+        if (data.writeToken && data.writeToken === writeToken) return; // ignore our own write
+        const rows = normalizeRows(data.rows);
+        // Dispatch to the host page; host controls rendering.
+        window.dispatchEvent(new CustomEvent('lineout:rows', { detail: { rows, meta: data.meta || {} } }));
+      }, (err) => console.error('[onSnapshot]', err));
+
+      setStatus(`listening on lineouts/${room}`);
+    }
+
+    function stop() {
+      if (unsub) { unsub(); unsub = null; }
+      setStatus('idle');
+    }
+
+    // ---- Public API ----
+    window.LineoutSync = {
+      start,
+      stop,
+      save: (rows, meta={}) => saveToCloud(currentRoom, rows, meta),
+      saveToCloud, // callable with explicit room id
+      isReady: () => !!uid,
+      get uid() { return uid; }
+    };
+
+    // ---- Event bridge ----
+    window.addEventListener('lineout:save', (e) => {
+      const { rows, meta, room } = e.detail || {};
+      const targetRoom = room || currentRoom;
+      if (!targetRoom) {
+        console.warn('[lineout:save] no room set');
+        return;
+      }
+      saveToCloud(targetRoom, rows, meta).catch(console.error);
+    });
+
+    // ---- Tiny test UI ----
+    $('startBtn').addEventListener('click', () => {
+      const r = ($('room').value || '').trim();
+      start(r).catch((e) => setStatus('Error: ' + e.message));
+    });
+    $('stopBtn').addEventListener('click', stop);
+    $('seedBtn').addEventListener('click', () => {
+      const r = ($('room').value || '').trim();
+      const sample = [
+        { id: 1, item: 'Warm‑up passing', spliced: true,  balanced: false, notes: '5 min', bg: 'bg-yellow' },
+        { id: 2, item: 'Set piece drill', spliced: false, balanced: true,  notes: '8 min', bg: 'bg-green'  },
+        { id: 3, item: 'Conditioning',    spliced: false, balanced: false, notes: 'finish strong', bg: '' }
+      ];
+      saveToCloud(r, sample, { title: 'Sample Session' }).catch(console.error);
+    });
+    $('emitBtn').addEventListener('click', () => {
+      const fake = [
+        { id: 'a', item: 'Local only row', spliced: false, balanced: false, notes: 'not saved', bg: '' }
+      ];
+      window.dispatchEvent(new CustomEvent('lineout:rows', { detail: { rows: fake, meta: { title: 'Local' } } }));
+    });
+
+    // Expose a console helper for quick manual tests:
+    // window.dispatchEvent(new CustomEvent('lineout:save', { detail: { room: 'demo', rows: [...], meta: {...} } }));
+  </script>
+</body>
+</html>
