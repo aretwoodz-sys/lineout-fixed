@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lineout — PDF → Interactive Checklist + Firestore Sync</title>
+  <style>
+    :root { --ink:#0f172a; --muted:#475569; --card:#fff; --ring:rgba(37,99,235,.25); --accent:#2563eb; }
+    *{box-sizing:border-box} body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; background:#f7fafc; color:var(--ink);}
+    .wrap{max-width:1000px;margin:24px auto;padding:16px}
+    .card{background:var(--card);border:1px solid rgba(15,23,42,.08);border-radius:14px;box-shadow:0 8px 24px rgba(2,6,23,.08);padding:16px;}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    input[type="text"]{padding:10px 12px;border:1px solid #e5e7eb;border-radius:10px;min-width:220px}
+    button{padding:10px 12px;border:1px solid rgba(15,23,42,.15);border-radius:10px;background:#fff;cursor:pointer}
+    button:hover{background:#f8fafc;box-shadow:0 2px 8px rgba(2,6,23,.08)}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#eef2ff;border:1px solid rgba(37,99,235,.25);font-size:12px}
+    .grid{display:grid;grid-template-columns:1fr;gap:10px}
+    .muted{color:var(--muted);font-size:13px}
+    #log{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;background:#0f172a;color:#e5e7eb;border-radius:10px;padding:12px;max-height:260px;overflow:auto}
+    .ok{color:#059669}.warn{color:#b45309}.err{color:#dc2626}
+    .hl{box-shadow:0 0 0 3px var(--ring)}
+    .sp{height:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 style="margin:0 0 8px">Lineout Sync (All‑in‑One)</h1>
+    <div class="muted" style="margin-bottom:12px">Anonymous auth + Firestore <span class="badge">/lineouts/{room}</span>. Use this while you wire your importer.</div>
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="grid">
+        <div class="row">
+          <label>Room ID</label>
+          <input id="roomId" type="text" placeholder="e.g. dev-room-1" />
+          <button id="btnInit">Init + Listen</button>
+          <button id="btnSave">Save Sample Rows</button>
+          <span id="who" class="muted"></span>
+        </div>
+        <div class="row">
+          <button id="btnCopyHelpers">Copy: saveRowsToCloud()</button>
+          <button id="btnTestEvent">Test Custom Event save</button>
+        </div>
+        <div class="muted">Listener updates call <code>applyRows(rows)</code> and <code>updateDocTitle()</code> if present on your page.</div>
+      </div>
+      <div class="sp"></div>
+      <div id="status" class="muted"></div>
+      <pre id="log"></pre>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px">How to wire importer</h3>
+      <ol class="muted">
+        <li>Call <code>saveRowsToCloud('your-room-id', rows)</code> after you parse a PDF, or</li>
+        <li>Dispatch <code>window.dispatchEvent(new CustomEvent('lineout:save', { detail: { room: 'your-room-id', rows } }))</code>.</li>
+        <li>Make sure Firestore rules allow your write (see below).</li>
+      </ol>
+      <details>
+        <summary>Suggested Firestore rules (prod)</summary>
+<pre>// rules_version = '2';
+// service cloud.firestore {
+//   match /databases/{database}/documents {
+//     match /lineouts/{room} {
+//       function isSignedIn() { return request.auth != null; }
+//       function isOwner() { return request.auth != null && resource.data.ownerUid == request.auth.uid; }
+
+//       allow create: if isSignedIn()
+//         && request.resource.data.ownerUid == request.auth.uid
+//         && request.resource.data.keys().hasOnly(['title','rows','updatedAt','ownerUid','public']);
+
+//       allow read: if (resource.data.public == true) || isOwner();
+
+//       allow update, delete: if isOwner()
+//         && request.resource.data.ownerUid == resource.data.ownerUid;
+//     }
+//   }
+// }</pre>
+      </details>
+    </div>
+  </div>
+
+  <!-- Firebase SDKs -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import { getAuth, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    // --- Your Firebase project (from your message) ---
+    const firebaseConfig = {
+      apiKey: "AIzaSyB-GAwSnt5mplQQ-0GV78Ud1v-JfqFuz0o",
+      authDomain: "lineout-3a851.firebaseapp.com",
+      projectId: "lineout-3a851",
+      storageBucket: "lineout-3a851.firebasestorage.app",
+      messagingSenderId: "133642224320",
+      appId: "1:133642224320:web:b47587ea9bbf80ea426325",
+      measurementId: "G-14R61YSV5V"
+    };
+
+    // --- Boot ---
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    const $ = (id) => document.getElementById(id);
+    const log = (...args) => { const el = $("log"); el.textContent += args.join(" ") + "\\n"; el.scrollTop = el.scrollHeight; };
+    const setStatus = (msg, cls='') => { $("status").className = 'muted ' + cls; $("status").textContent = msg; };
+
+    // --- Global helpers available to your page ---
+    window.LineoutSync = {
+      /** Ensure anonymous sign-in; returns current user */
+      async ensureAuth() {
+        if (auth.currentUser) return auth.currentUser;
+        await signInAnonymously(auth);
+        return new Promise((res) => onAuthStateChanged(auth, (u) => u && res(u), { once: true }));
+      },
+      /** Create doc if missing; attach ownerUid on first write */
+      async initRoom(room) {
+        const user = await this.ensureAuth();
+        const ref = doc(db, "lineouts", room);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) {
+          await setDoc(ref, { title: "New Room", rows: [], public: true, ownerUid: user.uid, updatedAt: serverTimestamp() });
+          log("Created room", room);
+        } else {
+          log("Room exists", room);
+        }
+        return { ref, user };
+      },
+      /** Save array of rows to Firestore */
+      async saveRows(room, rows, meta={}) {
+        const user = await this.ensureAuth();
+        const ref = doc(db, "lineouts", room);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) {
+          await setDoc(ref, { title: meta.title || "Checklist", rows, public: true, ownerUid: user.uid, updatedAt: serverTimestamp() });
+        } else {
+          await updateDoc(ref, { rows, ...(meta.title ? { title: meta.title } : {}), updatedAt: serverTimestamp() });
+        }
+        return true;
+      },
+      /** Live listen; cb receives {title, rows, updatedAt} */
+      async listen(room, cb) {
+        await this.ensureAuth();
+        const ref = doc(db, "lineouts", room);
+        return onSnapshot(ref, (snap) => {
+          if (!snap.exists()) return;
+          const data = snap.data();
+          cb({ title: data.title || "Checklist", rows: data.rows || [], updatedAt: data.updatedAt });
+        });
+      }
+    };
+
+    // Convenience shims
+    window.saveRowsToCloud = async (room, rows, meta={}) => {
+      try {
+        await window.LineoutSync.saveRows(room, rows, meta);
+        setStatus(`Saved ${rows?.length ?? 0} row(s) to "${room}"`, 'ok');
+      } catch (e) {
+        console.error(e); setStatus('Save failed: ' + (e?.message || e), 'err');
+      }
+    };
+
+    // Custom event hook: window.dispatchEvent(new CustomEvent('lineout:save', { detail: { room, rows, meta } }))
+    window.addEventListener('lineout:save', (ev) => {
+      const { room, rows, meta } = ev.detail || {};
+      const r = room || ($("roomId")?.value || 'default-room');
+      window.saveRowsToCloud(r, rows, meta);
+    });
+
+    // Demo wiring: if your app defines applyRows / updateDocTitle, call them on updates.
+    function applyIncoming({ title, rows }) {
+      if (typeof window.applyRows === 'function') {
+        try { window.applyRows(rows || []); } catch (e) { console.error(e); }
+      }
+      if (typeof window.updateDocTitle === 'function') {
+        try { window.updateDocTitle(title || 'Checklist'); } catch (e) { console.error(e); }
+      }
+    }
+
+    // --- Minimal dev harness UI ---
+    onAuthStateChanged(auth, (u) => {
+      $("who").textContent = u ? `signed in (anon uid: ${u.uid.slice(0,8)}…)` : 'auth: …';
+    });
+
+    $("btnInit").addEventListener('click', async () => {
+      const room = $("roomId").value.trim() || 'default-room';
+      $("roomId").classList.add('hl');
+      try {
+        const { user } = await window.LineoutSync.initRoom(room);
+        setStatus(`Listening to "${room}" as ${user.uid.slice(0,8)}…`, 'ok');
+        if (window.__unsub) { window.__unsub(); }
+        window.__unsub = await window.LineoutSync.listen(room, (data) => {
+          log('↘ incoming', JSON.stringify({ count: data.rows?.length || 0, title: data.title }));
+          applyIncoming(data);
+        });
+      } catch (e) {
+        console.error(e); setStatus('Init failed: ' + (e?.message || e), 'err');
+      } finally {
+        setTimeout(()=>$("roomId").classList.remove('hl'), 600);
+      }
+    });
+
+    $("btnSave").addEventListener('click', async () => {
+      const room = $("roomId").value.trim() || 'default-room';
+      const sample = [
+        { number: 1, description: "Sample item A", spliced: true, balanced: false, notes: "" },
+        { number: 2, description: "Sample item B", spliced: false, balanced: true, notes: "demo" }
+      ];
+      await window.saveRowsToCloud(room, sample, { title: "Demo Checklist" });
+    });
+
+    $("btnCopyHelpers").addEventListener('click', async () => {
+      const code = `// After parsing your PDF → rows[]
+saveRowsToCloud('YOUR-ROOM-ID', rows, { title: document.getElementById('title')?.textContent || 'Checklist' });
+
+// Or dispatch a custom event anywhere:
+window.dispatchEvent(new CustomEvent('lineout:save', { detail: { room: 'YOUR-ROOM-ID', rows } }));`;
+      try { await navigator.clipboard.writeText(code); setStatus('Copied helper snippet to clipboard', 'ok'); }
+      catch { setStatus('Could not copy — copy manually from console', 'warn'); console.log(code); }
+    });
+
+    $("btnTestEvent").addEventListener('click', () => {
+      const room = $("roomId").value.trim() || 'default-room';
+      const rows = [
+        { number: 1, description: "Event → saved row", spliced: false, balanced: false, notes: "" }
+      ];
+      window.dispatchEvent(new CustomEvent('lineout:save', { detail: { room, rows, meta:{ title: "Event Push" } } }));
+    });
+
+    // Kick anonymous auth asap
+    signInAnonymously(auth).catch(console.error);
+  </script>
+</body>
+</html>
